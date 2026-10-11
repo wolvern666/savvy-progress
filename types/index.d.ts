@@ -44,6 +44,40 @@ export type Panel = {
   isCompact: boolean
   isDoneCollapsed: boolean
   autoOpenedFor: string
+  /** Absent in state saved before the context section existed: expanded. */
+  isContextCollapsed?: boolean
+}
+
+/** One /context row; the engine's ContextCategory, restated so this contract stands alone. */
+export type ContextRow = {
+  name: string
+  tokens: number
+  /** A theme key (`promptBorder`, `inactive`). */
+  color: string
+  isDeferred: boolean
+  kind: 'used' | 'free' | 'buffer' | 'deferred'
+}
+
+/** One square of /context's grid; the engine's ContextGridSquare, restated. */
+export type ContextSquare = {
+  color: string
+  isFilled: boolean
+  categoryName: string
+  tokens: number
+  percentage: number
+  squareFullness: number
+}
+
+/** The main session's window as /context breaks it down, kept for drawing. */
+export type ContextSnap = {
+  model: string
+  totalTokens: number
+  maxTokens: number
+  percentage: number
+  autoCompactThreshold?: number
+  categories: ContextRow[]
+  gridRows: ContextSquare[][]
+  at: number
 }
 
 declare module 'claude-code' {
@@ -53,6 +87,7 @@ declare module 'claude-code' {
       agents: AgentRun[]
       panel: Panel
       now: number
+      context: ContextSnap | null
     }
   }
 }

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRun, Flow, Panel, Phase, PlannedTask } from '../types'
+import type { AgentRun, ContextSnap, Flow, Panel, Phase, PlannedTask } from '../types'
 
 const flow = atom({ plugin: 'savvy-progress', key: 'flow' } as const, null)
 const agents = atom({ plugin: 'savvy-progress', key: 'agents' } as const, [])
@@ -11,6 +11,7 @@ const panel = atom({ plugin: 'savvy-progress', key: 'panel' } as const, {
   autoOpenedFor: '',
 })
 const now = atom({ plugin: 'savvy-progress', key: 'now' } as const, 0)
+const context = atom({ plugin: 'savvy-progress', key: 'context' } as const, null)
 
 const TOOL = 'mcp__savvy-progress__progress'
 const STEP_TOOL = 'mcp__savvy-progress__step'
@@ -62,6 +63,10 @@ const STRINGS = {
     tasks: 'Tasks',
     review: 'Review',
     busy: 'running',
+    context: 'Session context',
+    contextLoading: 'Counting the context window…',
+    deferred: 'deferred',
+    autoCompact: 'auto-compact at',
   },
   ru: {
     pane: 'Агенты',
@@ -90,6 +95,10 @@ const STRINGS = {
     tasks: 'Задачи',
     review: 'Ревью',
     busy: 'в работе',
+    context: 'Контекст сессии',
+    contextLoading: 'Считаю окно контекста…',
+    deferred: 'отложено',
+    autoCompact: 'автосжатие при',
   },
 } as const
 
@@ -620,6 +629,42 @@ const ctxBar = (pct: number, width: number): string => {
 
 const STATUS_GLYPH: Record<string, string> = { running: '●', done: '✓', failed: '✗', planned: '◷' }
 
+// The main session's /context breakdown. A `full` count sends token-count
+// requests, so it runs only while the pane is up with the section expanded:
+// on open, on expand and after each main-session turn.
+let lastColumns: number | undefined
+let isCounting = false
+
+async function refreshContext($: EngineInterface): Promise<void> {
+  if (isCounting) return
+  if ((await read($, panel)).isContextCollapsed) return
+  if (!(await $.ui.panes()).some(p => p.id === PANE)) return
+  isCounting = true
+  try {
+    const { context: c } = await $.session.usage({ breakdown: 'full', columns: lastColumns })
+    const b = c.breakdown
+    if (!b) return
+    const at = await $.clock.now()
+    const snap: ContextSnap = {
+      model: b.model,
+      totalTokens: b.totalTokens,
+      maxTokens: b.rawMaxTokens,
+      percentage: b.percentage,
+      autoCompactThreshold: b.isAutoCompactEnabled ? b.autoCompactThreshold : undefined,
+      categories: b.categories,
+      gridRows: b.gridRows,
+      at,
+    }
+    await update($, context, () => snap)
+  } finally {
+    isCounting = false
+  }
+}
+
+// /context's squares: full, partial (under 0.7 full), and free.
+const square = (q: { isFilled: boolean; squareFullness: number }): string =>
+  !q.isFilled ? '⛶' : q.squareFullness < 0.7 ? '⛀' : '⛁'
+
 // Opens the agents pane, or closes it when it is up; true when it ends up open.
 async function togglePane($: EngineInterface): Promise<boolean> {
   const isOpen = (await $.ui.panes()).some(p => p.id === PANE)
@@ -630,6 +675,7 @@ async function togglePane($: EngineInterface): Promise<boolean> {
   const at = await $.clock.now()
   await update($, now, () => at)
   await $.ui.open({ id: PANE, title: tr().pane })
+  void refreshContext($)
   return true
 }
 
@@ -637,7 +683,7 @@ async function autoOpen($: EngineInterface, key: string): Promise<void> {
   const p = await read($, panel)
   if (p.autoOpenedFor === key) return
   await update($, panel, prev => ({ ...prev, autoOpenedFor: key }))
-  void $.ui.open({ id: PANE, title: tr().pane })
+  void $.ui.open({ id: PANE, title: tr().pane }).then(() => refreshContext($))
 }
 
 export const register: Register = (on, options) => {
@@ -798,7 +844,7 @@ export const register: Register = (on, options) => {
 
     const model = usage.model || e.model
     await update($, agents, list =>
-      list.map(a =>
+      list.map((a): AgentRun =>
         a.agentId !== agentId
           ? a
           : {
@@ -832,7 +878,7 @@ export const register: Register = (on, options) => {
     if (agentId) {
       const at = await $.clock.now()
       await update($, agents, list =>
-        list.map(a => {
+        list.map((a): AgentRun => {
           if (a.agentId !== agentId) return a
           // A run whose steps went unseen still gets the turn's own sum.
           const fallback = a.steps === 0 && e.usage
@@ -855,8 +901,11 @@ export const register: Register = (on, options) => {
         }),
       )
       await update($, now, () => at)
+      return next(e)
     }
-    return next(e)
+    const done = await next(e)
+    void refreshContext($)
+    return done
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -892,6 +941,50 @@ export const register: Register = (on, options) => {
       />
     )
     const isEmpty = list.length === 0 && planned.length === 0
+    lastColumns = e.props.bodyColumns || undefined
+
+    const ctx = await read($, context)
+    const isCtxCollapsed = p.isContextCollapsed === true
+    const ctxHead = ctx ? ` · ${ctx.percentage}% · ${fmtTokens(ctx.totalTokens)}/${fmtTokens(ctx.maxTokens)}` : ''
+    const contextSection = (
+      <Box key="context" flexDirection="column" marginBottom={1}>
+        <Button
+          key="context-toggle"
+          label={`${isCtxCollapsed ? '▸' : '▾'} ${s.context}${ctxHead}`}
+          plain
+          onPress={async () => {
+            const next = await update($, panel, prev => ({ ...prev, isContextCollapsed: !prev.isContextCollapsed }))
+            if (!next.isContextCollapsed) void refreshContext($)
+          }}
+        />
+        {!isCtxCollapsed && !ctx && <Text dimColor>{s.contextLoading}</Text>}
+        {!isCtxCollapsed && ctx && (
+          <Box flexDirection="column">
+            {ctx.gridRows.map((cells, y) => (
+              <Text key={`grid-${y}`}>
+                {cells.map((q, x) => (
+                  <Text key={`q-${x}`} color={q.color} dimColor={!q.isFilled}>
+                    {square(q)}{' '}
+                  </Text>
+                ))}
+              </Text>
+            ))}
+            <Text dimColor wrap="truncate-end">
+              {ctx.model}
+              {ctx.autoCompactThreshold ? ` · ${s.autoCompact} ${fmtTokens(ctx.autoCompactThreshold)}` : ''}
+            </Text>
+            {ctx.categories
+              .filter(c => c.tokens > 0)
+              .map(c => (
+                <Text key={`cat-${c.name}`} wrap="truncate-end" dimColor={c.kind !== 'used'}>
+                  <Text color={c.color}>{c.kind === 'free' ? '⛶' : '⛁'}</Text> {c.name}: {fmtTokens(c.tokens)}
+                  {c.isDeferred ? ` (${s.deferred})` : ` (${ctx.maxTokens ? ((c.tokens / ctx.maxTokens) * 100).toFixed(1) : '0'}%)`}
+                </Text>
+              ))}
+          </Box>
+        )}
+      </Box>
+    )
     const summary = `≈${fmtCost(t.cost)}, ${fmtTokens(t.tokens)} ${s.tokensWord}, ${fmtTime(t.time)}`
 
     if (e.surface === 'desktop' && 'Svg' in ui) {
@@ -906,6 +999,7 @@ export const register: Register = (on, options) => {
       if (p.isCompact) {
         return (
           <Box flexDirection="column" gap={1}>
+            {contextSection}
             <Svg source={compactSvg(W, list, planned, t)} alt={`${list.length} ${s.agentsCount}, ${summary}`} width={W} height={32} />
             {toggleCompact}
           </Box>
@@ -913,6 +1007,7 @@ export const register: Register = (on, options) => {
       }
       return (
         <Box flexDirection="column">
+          {contextSection}
           <Svg source={headerSvg(W, title, t)} alt={title ? `${title}: ${summary}` : summary} width={W} height={headerHeight(title)} />
           {toggleCompact}
           {isEmpty && <Text dimColor>{s.empty}</Text>}
@@ -971,6 +1066,7 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column">
+        {contextSection}
         <Box flexDirection="row" justifyContent="space-between">
           <Text bold wrap="truncate-end">
             {title}
