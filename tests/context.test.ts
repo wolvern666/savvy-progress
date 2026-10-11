@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On, SessionUsage } from 'claude-code'
+import type { MockClock } from 'claude-code/testing'
 
 const PANE_PROPS = {
   title: 'Agents',
@@ -47,14 +48,18 @@ const USAGE: SessionUsage = {
 }
 
 // Stands in for the engine beneath the plugin; counts the full breakdowns asked for.
-function engine(on: On, isPaneOpen: boolean): { counts: () => number } {
+function engine(on: On, isPaneOpen: boolean): { counts: () => number; opened: string[]; clock: MockClock } {
   let counts = 0
-  mock.clock(on)
+  const opened: string[] = []
+  const clock = mock.clock(on)
   mock.env(on, { LANG: 'en_US.UTF-8' })
   on('settings.read', async () => ({ value: {} }))
   on('tool.register', async (_$, e) => ({ value: { tool: e.name } }))
   on('command.register', async (_$, e) => ({ value: { command: e.name } }))
-  on('ui.open', async () => ({ value: { isPlaced: true } as const }))
+  on('ui.open', async (_$, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true } as const }
+  })
   on('ui.panes', async () => ({
     value: isPaneOpen
       ? [{ id: 'savvy-agents', title: 'Agents', isShown: true, isFocused: false, isPlaced: true, plugin: 'savvy-progress' }]
@@ -64,7 +69,7 @@ function engine(on: On, isPaneOpen: boolean): { counts: () => number } {
     if (e.breakdown === 'full') counts++
     return { value: USAGE }
   })
-  return { counts: () => counts }
+  return { counts: () => counts, opened, clock }
 }
 
 test('the agents pane shows the session context breakdown on every surface', async ($, on) => {
@@ -90,4 +95,12 @@ test('a collapsed section or a closed pane counts nothing', async ($, on) => {
   await ui.press({ key: 'context-toggle' })
   expect(usage.counts()).toBe(0)
   expect(await ui.find({ type: 'Text', text: /Counting the context window/ })).toBeDefined()
+})
+
+test('a new session opens the agents pane', async ($, on) => {
+  const { opened, clock } = engine(on, false)
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  expect(opened).toContain('savvy-agents')
 })

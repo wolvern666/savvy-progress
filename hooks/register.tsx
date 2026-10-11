@@ -751,6 +751,9 @@ export const register: Register = (on, options) => {
         await update($, now, () => at)
       })()
     })
+
+    // Up from the start: unasked, the engine seats it from 110-144 columns.
+    void $.ui.open({ id: PANE, title: tr().pane }).then(() => refreshContext($))
     return started
   })
 
