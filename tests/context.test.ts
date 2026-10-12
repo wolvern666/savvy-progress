@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { On, SessionUsage } from 'claude-code'
+import type { On, SessionMessage, SessionUsage } from 'claude-code'
 import type { MockClock } from 'claude-code/testing'
 
 const PANE_PROPS = {
@@ -46,6 +46,8 @@ const USAGE: SessionUsage = {
     },
   },
 }
+
+const MSG: SessionMessage = { role: 'user', text: 'hi', toolUses: [], toolResults: [] }
 
 // Stands in for the engine beneath the plugin; counts the full breakdowns asked for.
 function engine(on: On, isPaneOpen: boolean): { counts: () => number; opened: string[]; clock: MockClock } {
@@ -103,4 +105,34 @@ test('a new session opens the agents pane', async ($, on) => {
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await clock.settle()
   expect(opened).toContain('savvy-agents')
+})
+
+test('a compaction of the main conversation counts the window again', async ($, on) => {
+  const usage = engine(on, true)
+  on('session.compact', async () => ({ messages: [MSG], tokensBefore: 84_000, tokensAfter: 12_000 }))
+  const ui = await $.ui.mount({ plugin: 'savvy-progress', surface: 'terminal', component: 'Pane', props: PANE_PROPS, requestId: 'savvy-agents' })
+  await ui.press({ key: 'context-toggle' })
+  await ui.press({ key: 'context-toggle' })
+  expect(usage.counts()).toBe(1)
+  await $.session.compact({ trigger: 'manual', messages: [MSG] })
+  await usage.clock.settle()
+  expect(usage.counts()).toBe(2)
+  // A subagent's own compaction leaves the main window alone.
+  await $.session.compact({ trigger: 'auto', messages: [], agentId: 'a1' })
+  await usage.clock.settle()
+  expect(usage.counts()).toBe(2)
+})
+
+test('the main session effort sits next to the model', async ($, on) => {
+  const usage = engine(on, true)
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: null }
+  })
+  const steps = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', effort: 'high', messageCount: 1 })
+  for await (const _ of steps);
+  const ui = await $.ui.mount({ plugin: 'savvy-progress', surface: 'terminal', component: 'Pane', props: PANE_PROPS, requestId: 'savvy-agents' })
+  await ui.press({ key: 'context-toggle' })
+  await ui.press({ key: 'context-toggle' })
+  await usage.clock.settle()
+  expect(await ui.find({ type: 'Text', text: /claude-opus-5-5 · high · auto-compact at 160k/ })).toBeDefined()
 })

@@ -88,6 +88,8 @@ declare module 'claude-code' {
       panel: Panel
       now: number
       context: ContextSnap | null
+      /** The main session's effort level, from its last model request; '' before one. */
+      effort: string
     }
   }
 }

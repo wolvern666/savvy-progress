@@ -12,6 +12,7 @@ const panel = atom({ plugin: 'savvy-progress', key: 'panel' } as const, {
 })
 const now = atom({ plugin: 'savvy-progress', key: 'now' } as const, 0)
 const context = atom({ plugin: 'savvy-progress', key: 'context' } as const, null)
+const effort = atom({ plugin: 'savvy-progress', key: 'effort' } as const, '')
 
 const TOOL = 'mcp__savvy-progress__progress'
 const STEP_TOOL = 'mcp__savvy-progress__step'
@@ -631,34 +632,46 @@ const STATUS_GLYPH: Record<string, string> = { running: '●', done: '✓', fail
 
 // The main session's /context breakdown. A `full` count sends token-count
 // requests, so it runs only while the pane is up with the section expanded:
-// on open, on expand and after each main-session turn.
+// on open, on expand, after each main-session turn and after a compaction.
+// A call that comes in mid-count is not dropped: the count runs once more.
 let lastColumns: number | undefined
 let isCounting = false
+let isPending = false
 
 async function refreshContext($: EngineInterface): Promise<void> {
-  if (isCounting) return
-  if ((await read($, panel)).isContextCollapsed) return
-  if (!(await $.ui.panes()).some(p => p.id === PANE)) return
+  if (isCounting) {
+    isPending = true
+    return
+  }
   isCounting = true
   try {
-    const { context: c } = await $.session.usage({ breakdown: 'full', columns: lastColumns })
-    const b = c.breakdown
-    if (!b) return
-    const at = await $.clock.now()
-    const snap: ContextSnap = {
-      model: b.model,
-      totalTokens: b.totalTokens,
-      maxTokens: b.rawMaxTokens,
-      percentage: b.percentage,
-      autoCompactThreshold: b.isAutoCompactEnabled ? b.autoCompactThreshold : undefined,
-      categories: b.categories,
-      gridRows: b.gridRows,
-      at,
-    }
-    await update($, context, () => snap)
+    do {
+      isPending = false
+      await countContext($)
+    } while (isPending)
   } finally {
     isCounting = false
   }
+}
+
+async function countContext($: EngineInterface): Promise<void> {
+  if ((await read($, panel)).isContextCollapsed) return
+  if (!(await $.ui.panes()).some(p => p.id === PANE)) return
+  const { context: c } = await $.session.usage({ breakdown: 'full', columns: lastColumns })
+  const b = c.breakdown
+  if (!b) return
+  const at = await $.clock.now()
+  const snap: ContextSnap = {
+    model: b.model,
+    totalTokens: b.totalTokens,
+    maxTokens: b.rawMaxTokens,
+    percentage: b.percentage,
+    autoCompactThreshold: b.isAutoCompactEnabled ? b.autoCompactThreshold : undefined,
+    categories: b.categories,
+    gridRows: b.gridRows,
+    at,
+  }
+  await update($, context, () => snap)
 }
 
 // /context's squares: full, partial (under 0.7 full), and free.
@@ -842,6 +855,11 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     const result = yield* next(e)
     const agentId = e.agentId
+    // The main session's effort, shown next to its model in the context section.
+    if (!agentId && typeof e.effort === 'string' && e.effort !== (await read($, effort))) {
+      const level = e.effort
+      await update($, effort, () => level)
+    }
     const usage = result.usage
     if (!agentId || !usage) return result
 
@@ -911,6 +929,13 @@ export const register: Register = (on, options) => {
     return done
   })
 
+  // A compaction shrinks the main window between turns; count it again.
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (!e.agentId && e.trigger !== 'precompute' && !result.skip) void refreshContext($)
+    return result
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const s = tr()
     const ui = $.ui.resolve(e)
@@ -947,6 +972,7 @@ export const register: Register = (on, options) => {
     lastColumns = e.props.bodyColumns || undefined
 
     const ctx = await read($, context)
+    const level = await read($, effort)
     const isCtxCollapsed = p.isContextCollapsed === true
     const ctxHead = ctx ? ` · ${ctx.percentage}% · ${fmtTokens(ctx.totalTokens)}/${fmtTokens(ctx.maxTokens)}` : ''
     const contextSection = (
@@ -974,6 +1000,7 @@ export const register: Register = (on, options) => {
             ))}
             <Text dimColor wrap="truncate-end">
               {ctx.model}
+              {level ? ` · ${level}` : ''}
               {ctx.autoCompactThreshold ? ` · ${s.autoCompact} ${fmtTokens(ctx.autoCompactThreshold)}` : ''}
             </Text>
             {ctx.categories
